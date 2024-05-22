@@ -2,7 +2,9 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/Context.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 interface IEERC314 {
     event Transfer(address indexed from, address indexed to, uint256 value);
@@ -26,21 +28,21 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
     mapping(address account => uint256) private _balances;
     mapping(address => mapping(address => uint256)) private _allowances;
 
+
     uint256 private _totalSupply;
     uint256 public _maxWallet;
+    address public lpAddress;
     uint32 public blockToUnlockLiquidity;
     uint32 public coolingBlock;
-    uint32 public sellTax;
+    uint32 public sellTax = 50;
+    uint32 public maxSellTax = 50;
     uint32 public buyTax;
+    uint32 public maxBuyTax;
 
     mapping(address => bool) public excludeCoolingOf;
 
     string private _name;
     string private _symbol;
-
-    address public liquidityProvider;
-
-    bool public liquidityAdded;
 
     uint256 public constant _rebaseDuration = 1 hours;
     uint256 public _rebaseRate = 25;
@@ -48,12 +50,18 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
 
     mapping(address account => uint32) private lastTransaction;
 
+    mapping(address account => uint256) private liquidityProviderLock;
+    mapping(address account => uint256) private liquidityAddressBalance;
+    uint256 public liquidityBalance;
+    address public initLiquidityAddress;
+    uint256 public initLiquidityBalance;
+
     uint256 presaleAmount;
     bool public presaleEnable = false;
 
     modifier onlyLiquidityProvider() {
         require(
-            _msgSender() == liquidityProvider,
+            liquidityAddressBalance[_msgSender()] > 0,
             "You are not the liquidity provider"
         );
         _;
@@ -80,7 +88,6 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
         _lastRebaseTime = block.timestamp + 1 days;
 
         presaleAmount = (totalSupply_ * 2) / 10;
-
         uint256 liquidityAmount = totalSupply_ - presaleAmount;
         _balances[address(this)] = liquidityAmount;
     }
@@ -164,7 +171,6 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
     ) internal virtual {
         require(owner != address(0), "ERC20: approve from the zero address");
         require(spender != address(0), "ERC20: approve to the zero address");
-
         _allowances[owner][spender] = amount;
         emit Approval(owner, spender, amount);
     }
@@ -254,14 +260,29 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
         }
     }
 
+    function setLpAddress(address _lpAddress) external onlyOwner {
+        require(_lpAddress != address(0), "Zero address");
+        lpAddress = _lpAddress;
+    }
+
     function setBuyTax(uint32 _buyTax) external onlyOwner {
-        require(_buyTax <= 50, "Tax is too big");
+        require(_buyTax <= maxBuyTax, "Tax is too big");
         buyTax = _buyTax;
     }
 
     function setSellTax(uint32 _sellTax) external onlyOwner {
-        require(_sellTax <= 50, "Tax is too big");
+        require(_sellTax <= maxSellTax, "Tax is too big");
         sellTax = _sellTax;
+    }
+
+    function setMaxBuyTax(uint32 _maxBuyTax) external onlyOwner {
+        require(_maxBuyTax <= 100, "Tax is too big");
+        maxBuyTax = _maxBuyTax;
+    }
+
+    function setMaxSellTax(uint32 _maxSellTax) external onlyOwner {
+        require(_maxSellTax <= 100, "Tax is too big");
+        maxSellTax = _maxSellTax;
     }
 
     function setCooling(uint32 _coolingBlock) external onlyOwner {
@@ -271,39 +292,64 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
 
     function addLiquidity(
         uint32 _blockToUnlockLiquidity
-    ) public payable onlyOwner {
-        require(liquidityAdded == false, "Liquidity already added");
-
-        liquidityAdded = true;
-
+    ) public payable {
         require(msg.value > 0, "No ETH sent");
-        require(block.number < _blockToUnlockLiquidity, "Block number too low");
+        if (_blockToUnlockLiquidity > 0)
+            require(block.number < _blockToUnlockLiquidity, "Block number too low");
+        // init liq
+        uint256 lpBalance;
+        uint256 tokenAdd = 0;
+        if (liquidityBalance == 0) {
+            require(_msgSender() < owner(), "Init liquidity only owner");
+            initLiquidityBalance = Math.sqrt(msg.value, balanceOf(address(this)));
+            lpBalance = initLiquidityBalance;
+        } else {
+            lpBalance = liquidityAddressBalance[initLiquidityAddress];
+            tokenAdd = getAmountOut(msg.value, true);
+            require(tokenAdd < balanceOf(_msgSender()), "Token balance exceeded");
+        }
+        payable(address(this)).transfer(msg.value);
+        if (tokenAdd > 0)
+            _basicTransfer(_msgSender(), address(this), token);
+        liquidityAddressBalance[_msgSender()] = lpBalance;
+        liquidityBalance = liquidityBalance + lpBalance;
+        if (_blockToUnlockLiquidity > 0)
+            liquidityProviderLock[_msgSender()] = _blockToUnlockLiquidity;
+        emit AddLiquidity(_blockToUnlockLiquidity, lpBalance);
+    }
 
-        blockToUnlockLiquidity = _blockToUnlockLiquidity;
-        liquidityProvider = _msgSender();
-
-        emit AddLiquidity(_blockToUnlockLiquidity, msg.value);
+    function addLiquidity() public payable {
+        addLiquidity(0);
     }
 
     function removeLiquidity() public onlyLiquidityProvider {
-        require(block.number > blockToUnlockLiquidity, "Liquidity locked");
+        uint256 balance = liquidityAddressBalance[_msgSender()];
+        removeLiquidity(balance);
+    }
 
-        liquidityAdded = false;
-
-        payable(liquidityProvider).transfer(address(this).balance);
-
-        emit RemoveLiquidity(address(this).balance);
+    function removeLiquidity(uint256 _lpBalance) public onlyLiquidityProvider {
+        require(_lpBalance > 0, "Liquidity balance error");
+        uint256 lock2 = liquidityProviderLock[_msgSender()];
+        require(block.number > lock2, "Liquidity locked");
+        uint256 _totalSupply = liquidityBalance; // gas savings, must be defined here since totalSupply can update in _mintFee
+        uint256 eth = _lpBalance * address(this).balance / _totalSupply; // using balances ensures pro-rata distribution
+        uint256 token = _lpBalance * balanceOf(address(this)) / _totalSupply; // using balances ensures pro-rata distribution
+        require(eth > 0 && token > 0, 'INSUFFICIENT_LIQUIDITY_BURNED');
+        payable(_msgSender()).transfer(eth);
+        _basicTransfer(address(this), _msgSender(), token);
+        liquidityBalance = liquidityBalance - _lpBalance;
+        emit RemoveLiquidity(_lpBalance);
     }
 
     function extendLiquidityLock(
         uint32 _blockToUnlockLiquidity
     ) public onlyLiquidityProvider {
         require(
-            blockToUnlockLiquidity < _blockToUnlockLiquidity,
+            liquidityProviderLock[_msgSender()] < _blockToUnlockLiquidity,
             "You can't shorten duration"
         );
 
-        blockToUnlockLiquidity = _blockToUnlockLiquidity;
+        liquidityProviderLock[_msgSender()] = _blockToUnlockLiquidity;
     }
 
     function getAmountOut(
@@ -311,7 +357,6 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
         bool _buy
     ) public view returns (uint256) {
         (uint256 reserveETH, uint256 reserveToken) = getReserves();
-
         if (_buy) {
             return (value * reserveToken) / (reserveETH + value);
         } else {
@@ -320,30 +365,26 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
     }
 
     function buy() internal {
-        require(liquidityAdded, "Trading not enable");
+        require(liquidityBalance > 0, "Trading not enable");
         require(msg.sender == tx.origin, "Only external calls allowed");
 
         address owner = _msgSender();
 
         uint256 tokenAmount = (msg.value * _balances[address(this)]) /
             (address(this).balance);
-
-        require(
-            tokenAmount + _balances[owner] <= _maxWallet,
-            "Max wallet exceeded"
-        );
-
-        uint256 fee = (tokenAmount * buyTax) / 100;
-        _transfer(address(this), owner, tokenAmount - fee);
-        _basicTransfer(address(this), address(0xdead), fee);
-
+        if (_maxWallet > 0)
+            require(tokenAmount + _balances[owner] <= _maxWallet, "Max wallet exceeded");
+        if (buyTax > 0) {
+            uint256 fee = (tokenAmount * buyTax) / 100;
+            _transfer(address(this), owner, tokenAmount - fee);
+            _basicTransfer(address(this), address(0xdead), fee);
+        }
         emit Swap(owner, msg.value, 0, 0, tokenAmount);
     }
 
     function sell(address owner, uint256 amount) internal {
-        require(liquidityAdded, "Trading not enable");
+        require(liquidityBalance > 0, "Trading not enable");
         require(msg.sender == tx.origin, "Only external calls allowed");
-
         uint256 fee = (amount * sellTax) / 100;
         uint256 sellAmount = amount - fee;
 
@@ -357,10 +398,10 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
         );
 
         _transfer(owner, address(this), amount);
-        _basicTransfer(address(this), address(0xdead), fee);
-
+        if (fee > 0) {
+            _basicTransfer(address(this), address(0xdead), fee);
+        }
         payable(owner).transfer(ethAmount);
-
         emit Swap(owner, 0, amount, ethAmount, 0);
     }
 
@@ -378,13 +419,10 @@ abstract contract ERC314 is Context, Ownable, IEERC314 {
         _lastRebaseTime = nowTime;
 
         uint256 poolBalance = _balances[address(this)];
-        uint256 rebaseAmount = (((poolBalance * _rebaseRate) / 10000) *
-            (nowTime - lastRebaseTime)) / _rebaseDuration;
-
+        uint256 rebaseAmount = (((poolBalance * _rebaseRate) / 10000) * (nowTime - lastRebaseTime)) / _rebaseDuration;
         if (rebaseAmount > poolBalance / 2) {
             rebaseAmount = poolBalance / 2;
         }
-
         if (rebaseAmount > 0) {
             _basicTransfer(address(this), address(0xdead), rebaseAmount);
         }
